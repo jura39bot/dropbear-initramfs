@@ -1,0 +1,152 @@
+---
+# Playbook : Dropbear dans initramfs — Ubuntu 24.04 Server
+# Variables survey AWX :
+#   - ssh_public_key : clé publique SSH autorisée (obligatoire)
+#
+# Usage standalone :
+#   ansible-playbook -i inventory/hosts.yml playbook.yml \
+#     -e "ssh_public_key='ssh-ed25519 AAAA... user@host'"
+
+- name: Setup Dropbear initramfs
+  hosts: all
+  become: true
+
+  vars:
+    dropbear_port: 2222
+    dropbear_options: "-p {{ dropbear_port }} -s -j -k -I 60"
+    dropbear_authorized_keys_path: /etc/dropbear/initramfs/authorized_keys
+    dropbear_conf_path: /etc/dropbear/initramfs/dropbear.conf
+    initramfs_conf: /etc/initramfs-tools/initramfs.conf
+
+  tasks:
+
+    # ── 1. Récupérer le fichier netplan ────────────────────────────────────
+    - name: Trouver le fichier netplan
+      find:
+        paths: /etc/netplan
+        patterns: "*.yaml,*.yml"
+      register: netplan_files
+
+    - name: Vérifier qu'un fichier netplan existe
+      fail:
+        msg: "Aucun fichier netplan trouvé dans /etc/netplan/"
+      when: netplan_files.files | length == 0
+
+    - name: Lire le fichier netplan
+      slurp:
+        src: "{{ netplan_files.files[0].path }}"
+      register: netplan_raw
+
+    - name: Parser le YAML netplan
+      set_fact:
+        netplan: "{{ netplan_raw.content | b64decode | from_yaml }}"
+
+    # ── 2. Extraire IP / gateway / interface ──────────────────────────────
+    - name: Extraire les interfaces ethernets
+      set_fact:
+        _ethernets: "{{ netplan.network.ethernets | default({}) }}"
+        _bridges: "{{ netplan.network.bridges | default({}) }}"
+        _vlans: "{{ netplan.network.vlans | default({}) }}"
+
+    # Cherche la 1re interface (ethernet ou bridge) qui a une adresse IP
+    - name: Trouver l'interface principale avec IP statique
+      set_fact:
+        _iface_name: "{{ item.key }}"
+        _iface_data: "{{ item.value }}"
+      loop: "{{ (_bridges | combine(_ethernets) | combine(_vlans)) | dict2items }}"
+      when:
+        - item.value.addresses is defined
+        - item.value.addresses | length > 0
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Vérifier qu'une interface avec IP statique a été trouvée
+      fail:
+        msg: "Aucune interface avec adresse IP statique trouvée dans {{ netplan_files.files[0].path }}"
+      when: _iface_name is not defined
+
+    - name: Extraire IP, préfixe, gateway
+      set_fact:
+        # Adresse sans préfixe CIDR (ex: 192.168.1.10)
+        _ip: "{{ _iface_data.addresses[0] | ipaddr('address') }}"
+        # Netmask (ex: 255.255.255.0)
+        _netmask: "{{ _iface_data.addresses[0] | ipaddr('netmask') }}"
+        # Gateway (routes ou gateway4/gateway6)
+        _gateway: >-
+          {{
+            _iface_data.routes[0].via
+            if (_iface_data.routes is defined and _iface_data.routes | length > 0)
+            else _iface_data.get('gateway4', _iface_data.get('gateway6', ''))
+          }}
+
+    - name: Afficher la config réseau détectée
+      debug:
+        msg: |
+          Interface : {{ _iface_name }}
+          IP        : {{ _ip }}
+          Netmask   : {{ _netmask }}
+          Gateway   : {{ _gateway }}
+          Fichier   : {{ netplan_files.files[0].path }}
+
+    # ── 3. Installation ───────────────────────────────────────────────────
+    - name: Installer dropbear-initramfs
+      apt:
+        name: dropbear-initramfs
+        state: present
+        update_cache: true
+
+    # ── 4. Config réseau initramfs ─────────────────────────────────────────
+    - name: Configurer le réseau dans initramfs.conf
+      lineinfile:
+        path: "{{ initramfs_conf }}"
+        regexp: '^IP='
+        line: "IP={{ _ip }}::{{ _gateway }}:{{ _netmask }}::{{ _iface_name }}:none"
+        backup: true
+      notify: Régénérer initramfs
+
+    # ── 5. Clé SSH (variable survey AWX) ──────────────────────────────────
+    - name: Créer le répertoire dropbear initramfs
+      file:
+        path: /etc/dropbear/initramfs
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Ajouter la clé SSH autorisée
+      lineinfile:
+        path: "{{ dropbear_authorized_keys_path }}"
+        line: "{{ ssh_public_key }}"
+        create: true
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Régénérer initramfs
+
+    # ── 6. Config Dropbear ─────────────────────────────────────────────────
+    - name: Configurer Dropbear (port + désactivation mot de passe)
+      lineinfile:
+        path: "{{ dropbear_conf_path }}"
+        regexp: '^DROPBEAR_OPTIONS='
+        line: 'DROPBEAR_OPTIONS="{{ dropbear_options }}"'
+        create: true
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Régénérer initramfs
+
+    # ── 7. Vérification finale ─────────────────────────────────────────────
+    - name: Vérifier que Dropbear est dans l'initramfs
+      shell: "lsinitramfs /boot/initrd.img-$(uname -r) | grep -c dropbear"
+      register: check_dropbear
+      changed_when: false
+      failed_when: check_dropbear.stdout | int == 0
+
+    - name: Résultat
+      debug:
+        msg: "✅ Dropbear opérationnel — connexion : ssh -p {{ dropbear_port }} -i ~/.ssh/id_ed25519 root@{{ _ip }}"
+
+  # ── Handlers ──────────────────────────────────────────────────────────────
+  handlers:
+    - name: Régénérer initramfs
+      command: update-initramfs -u -k all

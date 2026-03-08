@@ -1,0 +1,94 @@
+---
+# Playbook : Serveur Tang — RHEL 10
+#
+# Usage :
+#   ansible-playbook -i inventory/hosts.yml tang-server-rhel.yml
+#
+# Variables optionnelles :
+#   - tang_port : port d'écoute (défaut: 80)
+
+- name: Setup serveur Tang (RHEL 10)
+  hosts: all
+  become: true
+
+  vars:
+    tang_port: 80
+
+  tasks:
+
+    - name: Vérifier que l'OS est bien RHEL/CentOS/Rocky/Alma
+      fail:
+        msg: "Ce playbook est réservé aux systèmes RHEL (ansible_os_family == 'RedHat')"
+      when: ansible_os_family != "RedHat"
+
+    # ── EPEL (requis pour certains outils) ──────────────────────────────
+    - name: Vérifier si EPEL est disponible
+      command: dnf repolist epel
+      register: epel_check
+      changed_when: false
+      failed_when: false
+
+    # ── Installation Tang ────────────────────────────────────────────────
+    - name: Installer tang
+      dnf:
+        name: tang
+        state: present
+        update_cache: true
+
+    - name: Configurer le port Tang si différent de 80
+      block:
+        - name: Créer le répertoire override systemd
+          file:
+            path: /etc/systemd/system/tangd.socket.d
+            state: directory
+            mode: '0755'
+
+        - name: Override du port
+          copy:
+            dest: /etc/systemd/system/tangd.socket.d/port.conf
+            content: |
+              [Socket]
+              ListenStream=
+              ListenStream={{ tang_port }}
+          notify: Recharger systemd et redémarrer Tang
+
+      when: tang_port | int != 80
+
+    - name: Ouvrir le port Tang dans firewalld
+      firewalld:
+        port: "{{ tang_port }}/tcp"
+        permanent: true
+        state: enabled
+        immediate: true
+
+    - name: Activer et démarrer tangd.socket
+      systemd:
+        name: tangd.socket
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Récupérer le thumbprint de la clé Tang
+      shell: |
+        jose jwk thp -i /var/db/tang/*.jwk 2>/dev/null | head -1
+      register: tang_thp
+      changed_when: false
+      ignore_errors: true
+
+    - name: "✅ Serveur Tang prêt"
+      debug:
+        msg: |
+          Serveur Tang opérationnel sur le port {{ tang_port }}.
+          URL       : http://{{ ansible_default_ipv4.address }}:{{ tang_port }}
+          Thumbprint: {{ tang_thp.stdout | default('Récupérer avec : jose jwk thp -i /var/db/tang/*.jwk') }}
+
+          Commande clevis côté client :
+          clevis luks bind -d /dev/sdX tang \
+            '{"url":"http://{{ ansible_default_ipv4.address }}:{{ tang_port }}","thp":"{{ tang_thp.stdout | default("<THUMBPRINT>") }}"}'
+
+  handlers:
+    - name: Recharger systemd et redémarrer Tang
+      systemd:
+        name: tangd.socket
+        state: restarted
+        daemon_reload: true

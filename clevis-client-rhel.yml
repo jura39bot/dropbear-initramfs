@@ -1,0 +1,182 @@
+---
+# Playbook : Clevis client — déchiffrement LUKS automatique via Tang
+# RHEL 10 — EFI + LVM + ext4
+#
+# Variables survey AWX :
+#   - tang_url         : URL du serveur Tang  ex: http://192.168.1.20
+#   - tang_thumbprint  : Empreinte SHA1 de la clé Tang (optionnel)
+#
+# Usage standalone :
+#   ansible-playbook -i inventory/hosts.yml clevis-client-rhel.yml \
+#     -e "tang_url=http://192.168.1.20" \
+#     -e "tang_thumbprint=abc123..."
+
+- name: Setup Clevis client RHEL (Tang + LUKS + dracut)
+  hosts: all
+  become: true
+
+  vars:
+    clevis_packages:
+      - clevis
+      - clevis-luks
+      - clevis-dracut
+      - dracut-network
+
+  tasks:
+
+    - name: Vérifier que l'OS est bien RHEL/CentOS/Rocky/Alma
+      fail:
+        msg: "Ce playbook est réservé aux systèmes RHEL (ansible_os_family == 'RedHat')"
+      when: ansible_os_family != "RedHat"
+
+    # ── 1. Détecter les partitions LUKS ──────────────────────────────────
+    - name: Lister tous les devices LUKS
+      shell: |
+        blkid -o device -t TYPE=crypto_LUKS
+      register: luks_devices_raw
+      changed_when: false
+      failed_when: luks_devices_raw.rc != 0 and luks_devices_raw.stdout == ""
+
+    - name: Vérifier qu'au moins un device LUKS est présent
+      fail:
+        msg: "Aucune partition LUKS (crypto_LUKS) détectée. Vérifier que le kickstart a bien activé --encrypted."
+      when: luks_devices_raw.stdout | trim == ""
+
+    - name: Construire la liste des devices LUKS
+      set_fact:
+        luks_devices: "{{ luks_devices_raw.stdout_lines | select('match', '^/dev/') | list }}"
+
+    - name: Afficher les devices LUKS détectés
+      debug:
+        msg: "Partitions LUKS détectées : {{ luks_devices }}"
+
+    # ── 2. Vérifier la joignabilité de Tang ──────────────────────────────
+    - name: Tester la connexion au serveur Tang
+      uri:
+        url: "{{ tang_url }}/adv"
+        method: GET
+        status_code: 200
+        timeout: 10
+
+    - name: Tang joignable ✅
+      debug:
+        msg: "Serveur Tang joignable à {{ tang_url }}"
+
+    # ── 3. Installation des paquets ───────────────────────────────────────
+    - name: Installer clevis et ses dépendances (dnf)
+      dnf:
+        name: "{{ clevis_packages }}"
+        state: present
+        update_cache: true
+
+    # ── 4. Binding LUKS → Tang ────────────────────────────────────────────
+    - name: Vérifier si le binding Tang existe déjà
+      shell: |
+        clevis luks list -d {{ item }} 2>/dev/null | grep -q tang && echo "bound" || echo "unbound"
+      register: binding_status
+      changed_when: false
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Binder LUKS → Tang (avec thumbprint)
+      shell: |
+        clevis luks bind -y -d {{ item.item }} tang \
+          '{"url":"{{ tang_url }}","thp":"{{ tang_thumbprint }}"}'
+      when:
+        - item.stdout == "unbound"
+        - tang_thumbprint is defined
+        - tang_thumbprint | trim != ""
+      loop: "{{ binding_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Binder LUKS → Tang (sans thumbprint — accepte automatiquement)
+      shell: |
+        clevis luks bind -y -d {{ item.item }} tang '{"url":"{{ tang_url }}"}'
+      when:
+        - item.stdout == "unbound"
+        - tang_thumbprint is not defined or tang_thumbprint | trim == ""
+      loop: "{{ binding_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 5. Vérifier les bindings ──────────────────────────────────────────
+    - name: Lister les bindings après configuration
+      shell: clevis luks list -d {{ item }}
+      register: clevis_list
+      changed_when: false
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Afficher les bindings
+      debug:
+        msg: "{{ item.item }} → {{ item.stdout }}"
+      loop: "{{ clevis_list.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 6. Activer le service clevis ──────────────────────────────────────
+    - name: Activer clevis-luks-askpass.path
+      systemd:
+        name: clevis-luks-askpass.path
+        enabled: true
+        state: started
+
+    # ── 7. Régénérer l'initramfs avec dracut ─────────────────────────────
+    - name: Récupérer la version du kernel actif
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    - name: Régénérer l'initramfs (dracut)
+      command: >
+        dracut --force
+               --add "clevis crypt network"
+               /boot/initramfs-{{ kernel_version.stdout }}.img
+               {{ kernel_version.stdout }}
+      register: dracut_result
+
+    - name: Log dracut
+      debug:
+        msg: "{{ dracut_result.stderr_lines | default([]) }}"
+
+    # ── 8. Vérification finale ────────────────────────────────────────────
+    - name: Vérifier que clevis est dans l'initramfs
+      shell: |
+        lsinitrd /boot/initramfs-{{ kernel_version.stdout }}.img | grep -c clevis
+      register: clevis_check
+      changed_when: false
+      failed_when: clevis_check.stdout | int == 0
+
+    - name: Test de déchiffrement (dry-run)
+      shell: |
+        clevis luks unlock -d {{ item }} -n clevis_test_{{ 999 | random }} \
+          && echo "OK" || echo "FAIL"
+      register: unlock_test
+      changed_when: false
+      ignore_errors: true
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Résultat du test
+      debug:
+        msg: "{{ item.item }} → {{ item.stdout }}"
+      loop: "{{ unlock_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 9. Résumé ─────────────────────────────────────────────────────────
+    - name: "✅ Configuration terminée"
+      debug:
+        msg: |
+          Clevis configuré avec succès sur RHEL 10.
+          Partitions LUKS bindées à {{ tang_url }} :
+          {% for d in luks_devices %}
+            - {{ d }}
+          {% endfor %}
+          Kernel : {{ kernel_version.stdout }}
+          Initramfs régénéré avec dracut.
+          Au prochain boot, déchiffrement automatique si Tang est joignable.

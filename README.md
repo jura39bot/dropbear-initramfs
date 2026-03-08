@@ -89,8 +89,38 @@ cryptroot-unlock
 ```
 .
 ├── ansible.cfg
-├── playbook.yml          # Playbook principal
+├── playbook.yml          # Dropbear dans initramfs
+├── clevis-client.yml     # Clevis client (déchiffrement LUKS via Tang)
+├── tang-server.yml       # Serveur Tang
 ├── inventory/
 │   └── hosts.yml         # Inventaire exemple
 └── README.md
 ```
+
+---
+
+## Tang + Clevis — déchiffrement LUKS automatique au boot
+
+### 1. Installer le serveur Tang
+
+```bash
+ansible-playbook -i inventory/hosts.yml tang-server.yml
+# → affiche l'URL et le thumbprint à utiliser côté client
+```
+
+### 2. Configurer les clients (serveurs à déchiffrer)
+
+```bash
+ansible-playbook -i inventory/hosts.yml clevis-client.yml \
+  -e "tang_url=http://192.168.1.20" \
+  -e "tang_thumbprint=<THUMBPRINT_AFFICHÉ>"
+```
+
+**Variables survey AWX :**
+
+| Variable | Type | Obligatoire | Description |
+|----------|------|-------------|-------------|
+| `tang_url` | Texte | ✅ | URL du serveur Tang ex: `http://192.168.1.20` |
+| `tang_thumbprint` | Texte | ❌ | Empreinte SHA1 — si vide, acceptée automatiquement |
+
+Le playbook détecte **automatiquement** toutes les partitions `crypto_LUKS` du système.

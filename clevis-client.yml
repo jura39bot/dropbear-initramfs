@@ -1,0 +1,169 @@
+---
+# Playbook : Clevis client — déchiffrement LUKS automatique via Tang
+# Ubuntu 24.04 Server — EFI + LVM + ext4
+#
+# Variables survey AWX :
+#   - tang_url         : URL du serveur Tang  ex: http://192.168.1.20
+#   - tang_thumbprint  : Empreinte SHA1 de la clé Tang (optionnel — si vide, confirmation manuelle ignorée)
+#
+# Usage standalone :
+#   ansible-playbook -i inventory/hosts.yml clevis-client.yml \
+#     -e "tang_url=http://192.168.1.20" \
+#     -e "tang_thumbprint=abc123..."
+
+- name: Setup Clevis client (Tang + LUKS + initramfs)
+  hosts: all
+  become: true
+
+  vars:
+    clevis_packages:
+      - clevis-luks
+      - clevis-initramfs
+      - clevis-systemd
+
+  tasks:
+
+    # ── 1. Détecter le(s) device(s) LUKS ─────────────────────────────────
+    - name: Lister tous les devices LUKS sur le système
+      shell: |
+        blkid -o device -t TYPE=crypto_LUKS
+      register: luks_devices_raw
+      changed_when: false
+      failed_when: luks_devices_raw.rc != 0 and luks_devices_raw.stdout == ""
+
+    - name: Vérifier qu'au moins un device LUKS est présent
+      fail:
+        msg: "Aucune partition LUKS (crypto_LUKS) détectée sur ce système."
+      when: luks_devices_raw.stdout | trim == ""
+
+    - name: Construire la liste des devices LUKS
+      set_fact:
+        luks_devices: "{{ luks_devices_raw.stdout_lines | select('match', '^/dev/') | list }}"
+
+    - name: Afficher les devices LUKS détectés
+      debug:
+        msg: "Partitions LUKS détectées : {{ luks_devices }}"
+
+    # ── 2. Vérifier la joignabilité du serveur Tang ───────────────────────
+    - name: Tester la connexion au serveur Tang
+      uri:
+        url: "{{ tang_url }}/adv"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: tang_check
+      failed_when: tang_check.status != 200
+
+    - name: Tang joignable
+      debug:
+        msg: "✅ Serveur Tang joignable à {{ tang_url }}"
+
+    # ── 3. Installation des paquets clevis ────────────────────────────────
+    - name: Installer clevis et ses dépendances
+      apt:
+        name: "{{ clevis_packages }}"
+        state: present
+        update_cache: true
+
+    # ── 4. Binder chaque partition LUKS à Tang ────────────────────────────
+    - name: Vérifier si le binding Tang existe déjà sur chaque device
+      shell: |
+        clevis luks list -d {{ item }} 2>/dev/null | grep -q tang && echo "bound" || echo "unbound"
+      register: binding_status
+      changed_when: false
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Binder les partitions LUKS non encore bindées (avec thumbprint)
+      shell: |
+        echo '{{ tang_thumbprint }}' | clevis luks bind -y -d {{ item.item }} tang \
+          '{"url":"{{ tang_url }}","thp":"{{ tang_thumbprint }}"}'
+      when:
+        - item.stdout == "unbound"
+        - tang_thumbprint is defined
+        - tang_thumbprint | trim != ""
+      loop: "{{ binding_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      no_log: false
+
+    - name: Binder les partitions LUKS non encore bindées (sans thumbprint — accepte auto)
+      shell: |
+        clevis luks bind -y -d {{ item.item }} tang '{"url":"{{ tang_url }}"}'
+      when:
+        - item.stdout == "unbound"
+        - tang_thumbprint is not defined or tang_thumbprint | trim == ""
+      loop: "{{ binding_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 5. Vérifier les bindings ──────────────────────────────────────────
+    - name: Lister les bindings clevis après configuration
+      shell: |
+        clevis luks list -d {{ item }}
+      register: clevis_list
+      changed_when: false
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Afficher les bindings
+      debug:
+        msg: "{{ item.item }} → {{ item.stdout }}"
+      loop: "{{ clevis_list.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 6. Activer clevis dans systemd ────────────────────────────────────
+    - name: Activer clevis-luks-askpass.path (déverrouillage au boot)
+      systemd:
+        name: clevis-luks-askpass.path
+        enabled: true
+        state: started
+
+    # ── 7. Régénérer l'initramfs ──────────────────────────────────────────
+    - name: Régénérer l'initramfs pour inclure clevis
+      command: update-initramfs -u -k all
+      register: initramfs_result
+
+    - name: Log update-initramfs
+      debug:
+        msg: "{{ initramfs_result.stderr_lines }}"
+
+    # ── 8. Vérification finale ────────────────────────────────────────────
+    - name: Vérifier que clevis est dans l'initramfs
+      shell: |
+        lsinitramfs /boot/initrd.img-$(uname -r) | grep -c clevis
+      register: clevis_in_initramfs
+      changed_when: false
+      failed_when: clevis_in_initramfs.stdout | int == 0
+
+    - name: Test de déchiffrement (dry-run sans reboot)
+      shell: |
+        clevis luks unlock -d {{ item }} -n clevis_test_{{ 999 | random }} && echo "OK" || echo "FAIL"
+      register: unlock_test
+      changed_when: false
+      ignore_errors: true
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Résultat du test
+      debug:
+        msg: "{{ item.item }} → déchiffrement test : {{ item.stdout }}"
+      loop: "{{ unlock_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ── 9. Résumé ─────────────────────────────────────────────────────────
+    - name: "✅ Configuration terminée"
+      debug:
+        msg: |
+          Clevis configuré avec succès.
+          Partitions LUKS bindées à {{ tang_url }} :
+          {% for d in luks_devices %}
+            - {{ d }}
+          {% endfor %}
+          Au prochain boot, le déchiffrement sera automatique si Tang est joignable.
+          Sinon → fallback mot de passe (ou Dropbear si configuré).

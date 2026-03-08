@@ -1,0 +1,171 @@
+#cloud-config
+# Ubuntu 24.04 Server — Autoinstall PXE
+# Stockage : EFI + /boot ext4 + LUKS + LVM + ext4
+#
+# ⚠️  Adapter obligatoirement :
+#   - path: /dev/sda       → votre disque cible
+#   - identity             → hostname, username, password
+#   - network              → IP, gateway, DNS
+#   - luks_key_id / key    → mot de passe LUKS temporaire (sera remplacé par clevis/Tang)
+
+autoinstall:
+  version: 1
+
+  # ── Locale & clavier ────────────────────────────────────────────────────
+  locale: fr_FR.UTF-8
+  keyboard:
+    layout: fr
+    variant: ""
+
+  # ── Réseau ───────────────────────────────────────────────────────────────
+  # Adapter selon votre infrastructure
+  network:
+    version: 2
+    ethernets:
+      # Remplacer ens3 par le nom réel de l'interface
+      ens3:
+        addresses:
+          - 192.168.1.10/24
+        gateway4: 192.168.1.1
+        nameservers:
+          addresses:
+            - 192.168.1.1
+            - 8.8.8.8
+        # DHCP alternatif :
+        # dhcp4: true
+
+  # ── Identité ─────────────────────────────────────────────────────────────
+  identity:
+    hostname: srv-ubuntu
+    username: adminlocal
+    # Générer avec : echo 'motdepasse' | openssl passwd -6 -stdin
+    password: "$6$rounds=4096$SALT$HASH"
+
+  # ── SSH ──────────────────────────────────────────────────────────────────
+  ssh:
+    install-server: true
+    allow-pw: false
+    authorized-keys:
+      - "ssh-ed25519 AAAA... user@host"   # ← remplacer par votre clé
+
+  # ── Paquets à installer ──────────────────────────────────────────────────
+  packages:
+    - openssh-server
+    - dropbear-initramfs
+    - clevis-luks
+    - clevis-initramfs
+    - clevis-systemd
+    - python3
+    - python3-apt
+    - lvm2
+
+  # ── Stockage : EFI + /boot + LUKS + LVM ─────────────────────────────────
+  storage:
+    config:
+
+      # ── Disque ────────────────────────────────────────────────────────────
+      - type: disk
+        id: disk0
+        path: /dev/sda            # ← adapter : sda, nvme0n1, vda…
+        ptable: gpt
+        wipe: superblock-recursive
+        grub_device: true
+
+      # ── Partition EFI ─────────────────────────────────────────────────────
+      - type: partition
+        id: part-efi
+        device: disk0
+        size: 512M
+        flag: boot
+        grub_device: true
+
+      # ── Partition /boot (non chiffrée — obligatoire pour GRUB) ───────────
+      - type: partition
+        id: part-boot
+        device: disk0
+        size: 2G
+
+      # ── Partition LUKS (tout le reste du disque) ──────────────────────────
+      - type: partition
+        id: part-luks
+        device: disk0
+        size: -1
+
+      # ── Chiffrement LUKS ──────────────────────────────────────────────────
+      # Le mot de passe est temporaire : clevis le remplacera par un binding Tang
+      - type: dm_crypt
+        id: luks0
+        volume: part-luks
+        key: "MotDePasseTemporaire123!"   # ← changer — sera conservé comme fallback
+
+      # ── LVM sur le volume LUKS ────────────────────────────────────────────
+      - type: lvm_volgroup
+        id: vg0
+        name: ubuntu-vg
+        devices:
+          - luks0
+
+      # ── Volume logique racine ─────────────────────────────────────────────
+      - type: lvm_partition
+        id: lv-root
+        volgroup: vg0
+        name: ubuntu-lv
+        size: -1                  # tout l'espace disponible
+
+      # ── Formats ───────────────────────────────────────────────────────────
+      - type: format
+        id: fmt-efi
+        volume: part-efi
+        fstype: fat32
+
+      - type: format
+        id: fmt-boot
+        volume: part-boot
+        fstype: ext4
+
+      - type: format
+        id: fmt-root
+        volume: lv-root
+        fstype: ext4
+
+      # ── Points de montage ─────────────────────────────────────────────────
+      - type: mount
+        id: mnt-efi
+        device: fmt-efi
+        path: /boot/efi
+
+      - type: mount
+        id: mnt-boot
+        device: fmt-boot
+        path: /boot
+
+      - type: mount
+        id: mnt-root
+        device: fmt-root
+        path: /
+
+  # ── Late commands (post-install) ──────────────────────────────────────────
+  # Exécutés dans le chroot après installation, avant le reboot
+  late-commands:
+    # Config réseau initramfs pour Dropbear (adapter l'IP et l'interface)
+    - |
+      echo 'IP=192.168.1.10::192.168.1.1:255.255.255.0::ens3:none' >> \
+        /target/etc/initramfs-tools/initramfs.conf
+
+    # Config Dropbear : clé SSH uniquement, port 2222
+    - |
+      echo 'DROPBEAR_OPTIONS="-p 2222 -s -j -k -I 60"' > \
+        /target/etc/dropbear/initramfs/dropbear.conf
+
+    # Clé SSH pour déverrouillage Dropbear au boot
+    - mkdir -p /target/etc/dropbear/initramfs
+    - |
+      echo 'ssh-ed25519 AAAA... user@host' > \
+        /target/etc/dropbear/initramfs/authorized_keys
+    - chmod 600 /target/etc/dropbear/initramfs/authorized_keys
+
+    # Régénérer l'initramfs avec Dropbear inclus
+    - curtin in-target --target=/target -- update-initramfs -u -k all
+
+  # ── Confirmation automatique (pas de prompt interactif) ──────────────────
+  confirm-autoinstall: false

@@ -94,7 +94,27 @@ cryptroot-unlock
 ├── tang-server.yml       # Serveur Tang
 ├── inventory/
 │   └── hosts.yml         # Inventaire exemple
+├── pxe/
+│   ├── user-data         # Autoinstall Ubuntu 24.04 (LUKS + LVM + EFI)
+│   ├── meta-data         # Métadonnées cloud-init
+│   └── README.md         # Guide PXE
 └── README.md
+```
+
+---
+
+## Workflow complet (PXE → Tang → Clevis)
+
+```
+1. pxe/user-data  → Installation Ubuntu 24.04 avec LUKS + LVM
+                     Dropbear pré-configuré dans initramfs
+                              ↓
+2. tang-server.yml → Serveur Tang opérationnel
+                              ↓
+3. clevis-client.yml → LUKS bindé à Tang, initramfs régénéré
+                              ↓
+4. Reboot → déchiffrement automatique ✅
+            Dropbear en fallback si Tang injoignable
 ```
 
 ---

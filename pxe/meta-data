@@ -1,0 +1,2 @@
+instance-id: ubuntu-server-luks
+local-hostname: srv-ubuntu

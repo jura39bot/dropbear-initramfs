@@ -1,0 +1,220 @@
+---
+# Playbook : dracut-sshd dans l'initramfs — RHEL 10
+# Équivalent RHEL du playbook Dropbear Ubuntu (playbook.yml)
+# Port 2222 — clé SSH uniquement (pas de mot de passe)
+#
+# Variables survey AWX :
+#   - ssh_public_key : clé publique SSH autorisée (obligatoire)
+#
+# Usage standalone :
+#   ansible-playbook -i inventory/hosts.yml dracut-sshd-rhel.yml \
+#     -e "ssh_public_key='ssh-ed25519 AAAA... user@host'"
+
+- name: Setup dracut-sshd dans l'initramfs (RHEL 10)
+  hosts: all
+  become: true
+
+  vars:
+    sshd_port: 2222
+    dracut_sshd_conf: /etc/dracut.conf.d/sshd.conf
+    dracut_network_conf: /etc/dracut.conf.d/network.conf
+
+  tasks:
+
+    - name: Vérifier que l'OS est bien RHEL/CentOS/Rocky/Alma
+      fail:
+        msg: "Ce playbook est réservé aux systèmes RHEL (ansible_os_family == 'RedHat'). Pour Ubuntu utiliser playbook.yml."
+      when: ansible_os_family != "RedHat"
+
+    # ── 1. Récupérer la config réseau depuis nmcli ─────────────────────────
+    - name: Récupérer les connexions NetworkManager actives
+      shell: |
+        nmcli -t -f NAME,DEVICE,STATE con show --active | grep ":activated" | head -1
+      register: nm_con_raw
+      changed_when: false
+
+    - name: Extraire le nom de l'interface active
+      set_fact:
+        _iface: "{{ nm_con_raw.stdout.split(':')[1] }}"
+
+    - name: Récupérer IP, netmask, gateway de l'interface active
+      shell: |
+        nmcli -t -f IP4.ADDRESS,IP4.GATEWAY con show "{{ nm_con_raw.stdout.split(':')[0] }}"
+      register: nm_ip_raw
+      changed_when: false
+
+    - name: Extraire l'adresse IP (avec préfixe CIDR)
+      set_fact:
+        _ip_cidr: "{{ nm_ip_raw.stdout_lines | select('match', '^IP4.ADDRESS') | first | regex_replace('^IP4.ADDRESS\\[\\d+\\]:', '') }}"
+        _gateway: "{{ nm_ip_raw.stdout_lines | select('match', '^IP4.GATEWAY') | first | regex_replace('^IP4.GATEWAY:', '') }}"
+
+    - name: Calculer IP et netmask séparément
+      set_fact:
+        _ip: "{{ _ip_cidr | ipaddr('address') }}"
+        _netmask: "{{ _ip_cidr | ipaddr('netmask') }}"
+        _hostname: "{{ ansible_hostname }}"
+
+    - name: Afficher la config réseau détectée
+      debug:
+        msg: |
+          Interface : {{ _iface }}
+          IP        : {{ _ip }}
+          Netmask   : {{ _netmask }}
+          Gateway   : {{ _gateway }}
+          Hostname  : {{ _hostname }}
+
+    # ── 2. Activer EPEL ───────────────────────────────────────────────────
+    - name: Vérifier si EPEL est déjà installé
+      shell: dnf repolist enabled | grep -c epel
+      register: epel_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Installer EPEL si absent
+      dnf:
+        name: "https://dl.fedoraproject.org/pub/epel/epel-release-latest-{{ ansible_distribution_major_version }}.noarch.rpm"
+        state: present
+        disable_gpg_check: true
+      when: epel_installed.stdout | int == 0
+
+    - name: Rafraîchir le cache dnf
+      dnf:
+        update_cache: true
+
+    # ── 3. Installer dracut-sshd ──────────────────────────────────────────
+    - name: Installer dracut-sshd et dracut-network
+      dnf:
+        name:
+          - dracut-sshd
+          - dracut-network
+        state: present
+
+    # ── 4. Clé SSH autorisée (variable survey AWX) ────────────────────────
+    - name: Créer le répertoire .ssh de root
+      file:
+        path: /root/.ssh
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Ajouter la clé SSH dans authorized_keys de root
+      lineinfile:
+        path: /root/.ssh/authorized_keys
+        line: "{{ ssh_public_key }}"
+        create: true
+        owner: root
+        group: root
+        mode: '0600'
+
+    # ── 5. Config dracut — module sshd + port 2222 ────────────────────────
+    - name: Configurer dracut-sshd (module + port 2222)
+      copy:
+        dest: "{{ dracut_sshd_conf }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # dracut-sshd — généré par Ansible
+          # Port 2222 — identique à Dropbear Ubuntu
+          add_dracutmodules+=" sshd "
+          kernel_cmdline+=" rd.sshd.port={{ sshd_port }} "
+
+    # ── 6. Config réseau statique dans l'initramfs ────────────────────────
+    # Format : ip=<IP>::<GW>:<MASK>:<HOSTNAME>:<IFACE>:none
+    - name: Configurer le réseau statique pour l'initramfs
+      copy:
+        dest: "{{ dracut_network_conf }}"
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Réseau initramfs — généré par Ansible
+          add_dracutmodules+=" network "
+          kernel_cmdline+=" ip={{ _ip }}::{{ _gateway }}:{{ _netmask }}:{{ _hostname }}:{{ _iface }}:none "
+
+    # ── 7. Récupérer la version du kernel actif ───────────────────────────
+    - name: Récupérer la version du kernel
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    # ── 8. Régénérer l'initramfs ──────────────────────────────────────────
+    - name: Régénérer l'initramfs avec dracut (sshd + clevis + network)
+      command: >
+        dracut --force
+               --add "sshd network crypt"
+               /boot/initramfs-{{ kernel_version.stdout }}.img
+               {{ kernel_version.stdout }}
+      register: dracut_result
+
+    - name: Log dracut
+      debug:
+        msg: "{{ dracut_result.stderr_lines | default([]) }}"
+
+    # ── 9. Mettre à jour la ligne de boot GRUB ────────────────────────────
+    # Ajouter les paramètres kernel (réseau + port SSH) dans GRUB
+    - name: Vérifier si les paramètres sont déjà dans /etc/default/grub
+      shell: grep -c "rd.sshd.port" /etc/default/grub
+      register: grub_check
+      changed_when: false
+      failed_when: false
+
+    - name: Ajouter les paramètres kernel dans GRUB
+      lineinfile:
+        path: /etc/default/grub
+        regexp: '^GRUB_CMDLINE_LINUX='
+        line: >-
+          GRUB_CMDLINE_LINUX="rd.luks rd.lvm
+          ip={{ _ip }}::{{ _gateway }}:{{ _netmask }}:{{ _hostname }}:{{ _iface }}:none
+          rd.sshd.port={{ sshd_port }}"
+        backup: true
+      when: grub_check.stdout | int == 0
+      notify: Régénérer GRUB
+
+    # ── 10. Vérifications finales ─────────────────────────────────────────
+    - name: Vérifier que sshd est dans l'initramfs
+      shell: |
+        lsinitrd /boot/initramfs-{{ kernel_version.stdout }}.img | grep -c sshd
+      register: sshd_check
+      changed_when: false
+      failed_when: sshd_check.stdout | int == 0
+
+    - name: Vérifier que la clé SSH est dans l'initramfs
+      shell: |
+        lsinitrd /boot/initramfs-{{ kernel_version.stdout }}.img | grep authorized_keys
+      register: key_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: Vérifier que le réseau est dans l'initramfs
+      shell: |
+        lsinitrd /boot/initramfs-{{ kernel_version.stdout }}.img | grep -c network
+      register: net_check
+      changed_when: false
+      ignore_errors: true
+
+    - name: "✅ Résumé configuration"
+      debug:
+        msg: |
+          dracut-sshd configuré avec succès.
+          ─────────────────────────────────────────
+          Interface  : {{ _iface }}
+          IP         : {{ _ip }}
+          Port SSH   : {{ sshd_port }}
+          Auth       : clé SSH uniquement
+          Kernel     : {{ kernel_version.stdout }}
+          ─────────────────────────────────────────
+          sshd dans initramfs    : {{ '✅' if sshd_check.stdout | int > 0 else '⚠️ MANQUANT' }}
+          authorized_keys        : {{ '✅' if key_check.rc == 0 else '⚠️ MANQUANT' }}
+          réseau dans initramfs  : {{ '✅' if net_check.stdout | int > 0 else '⚠️ MANQUANT' }}
+          ─────────────────────────────────────────
+          Connexion au boot :
+          ssh -p {{ sshd_port }} -i ~/.ssh/id_ed25519 root@{{ _ip }}
+          Puis déverrouiller :
+          systemd-tty-ask-password-agent --query
+
+  # ── Handlers ──────────────────────────────────────────────────────────────
+  handlers:
+    - name: Régénérer GRUB
+      command: grub2-mkconfig -o /boot/grub2/grub.cfg

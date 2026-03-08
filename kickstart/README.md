@@ -4,6 +4,26 @@ Installation automatique RHEL 10 avec **EFI + /boot ext4 + LUKS + LVM + ext4**.
 
 ---
 
+## SSH dans l'initramfs — dracut-sshd
+
+Sur RHEL, **Dropbear n'est pas dans les repos officiels**. Le kickstart utilise à la place **`dracut-sshd`** (EPEL) qui intègre OpenSSH dans l'initramfs dracut.
+
+```
+Ubuntu 24.04  → dropbear-initramfs  (port 2222)
+RHEL 10       → dracut-sshd         (port 22, via EPEL)
+```
+
+Connexion au boot pour déverrouillage manuel :
+```bash
+ssh -i ~/.ssh/id_ed25519 root@192.168.1.10
+# puis :
+systemd-tty-ask-password-agent --query
+# ou :
+echo "MotDePasse" > /run/cryptsetup-keys.d/...
+```
+
+---
+
 ## À adapter dans `ks.cfg`
 
 | Champ | Défaut | Description |
@@ -15,9 +35,11 @@ Installation automatique RHEL 10 avec **EFI + /boot ext4 + LUKS + LVM + ext4**.
 | `--hostname=` | `srv-rhel` | Nom du serveur |
 | `rootpw` | — | Hash SHA-512 (`openssl passwd -6`) |
 | `user --password=` | — | Hash SHA-512 admin |
-| `sshkey` | — | Clé SSH publique |
+| `sshkey` | — | Clé SSH publique (accès normal) |
+| `authorized_keys` dans `%post` | — | Clé SSH pour déverrouillage initramfs |
 | `--drives=sda` | `sda` | Disque cible |
 | `--passphrase=` | `MotDePasseTemporaire123!` | Mot de passe LUKS fallback |
+| `kernel_cmdline ip=` | `192.168.1.10` | IP réseau dans l'initramfs |
 
 **Générer un hash de mot de passe :**
 ```bash

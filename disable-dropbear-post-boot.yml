@@ -1,0 +1,17 @@
+---
+# Playbook : Désactiver Dropbear (port 2222) dès que sshd est actif
+# Ubuntu 24.04 — service systemd oneshot
+#
+# Usage standalone :
+#   ansible-playbook -i inventory/hosts.yml disable-dropbear-post-boot.yml
+#
+# Ou intégrer directement dans playbook.yml en ajoutant le rôle :
+#   roles:
+#     - dropbear_initramfs
+#     - disable-dropbear-post-boot
+
+- name: Désactiver Dropbear port 2222 post-boot
+  hosts: all
+  become: true
+  roles:
+    - disable-dropbear-post-boot

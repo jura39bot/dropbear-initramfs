@@ -7,7 +7,7 @@
 #   ansible-playbook -i inventory/hosts.yml playbook.yml \
 #     -e "ssh_public_key='ssh-ed25519 AAAA... user@host'"
 
-- name: Setup Dropbear initramfs
+- name: Setup Dropbear initramfs + désactivation automatique post-boot
   hosts: all
   become: true
 

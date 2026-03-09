@@ -1,0 +1,110 @@
+---
+# Rôle : disable-dropbear-post-boot
+# Désactive le port 2222 (Dropbear) automatiquement dès que sshd est actif
+# Ubuntu 24.04 — nftables / ufw
+
+- name: Vérifier que l'OS est Ubuntu
+  fail:
+    msg: "Ce rôle est pour Ubuntu. Voir disable-dropbear-post-boot-rhel pour RHEL."
+  when: ansible_distribution != "Ubuntu"
+
+# ── 1. Créer le script de désactivation ────────────────────────────────────
+- name: Créer le script de fermeture du port 2222
+  copy:
+    dest: /usr/local/sbin/disable-dropbear-port.sh
+    mode: '0750'
+    owner: root
+    group: root
+    content: |
+      #!/bin/bash
+      # Désactive le port 2222 (Dropbear initramfs) une fois sshd actif
+      # Exécuté par systemd après ssh.service
+
+      LOGFILE=/var/log/disable-dropbear.log
+      echo "[$(date)] Vérification Dropbear..." >> "$LOGFILE"
+
+      # Vérifier que sshd écoute bien avant de bloquer
+      if ! ss -tlnp | grep -q ':22 '; then
+        echo "[$(date)] ⚠️  sshd ne semble pas écouter sur :22 — abandon" >> "$LOGFILE"
+        exit 1
+      fi
+
+      # Tuer tout processus dropbear résiduel (sécurité)
+      if pgrep -x dropbear > /dev/null; then
+        echo "[$(date)] Processus dropbear détecté — kill" >> "$LOGFILE"
+        pkill -x dropbear
+      fi
+
+      # Bloquer le port 2222 avec ufw si disponible
+      if command -v ufw > /dev/null && ufw status | grep -q "Status: active"; then
+        ufw deny in on any to any port 2222 comment "Dropbear initramfs disabled post-boot" > /dev/null
+        echo "[$(date)] ✅ Port 2222 bloqué via ufw" >> "$LOGFILE"
+      fi
+
+      # Bloquer avec nftables (toujours appliqué, même sans ufw)
+      if command -v nft > /dev/null; then
+        # Ajouter une règle drop sur le port 2222 si pas déjà présente
+        if ! nft list ruleset | grep -q "tcp dport 2222 drop"; then
+          nft add rule inet filter input tcp dport 2222 drop
+          echo "[$(date)] ✅ Port 2222 bloqué via nftables" >> "$LOGFILE"
+        fi
+      fi
+
+      echo "[$(date)] ✅ Dropbear désactivé post-boot — port 2222 fermé" >> "$LOGFILE"
+      exit 0
+
+# ── 2. Créer le service systemd ────────────────────────────────────────────
+- name: Créer le service systemd disable-dropbear
+  copy:
+    dest: /etc/systemd/system/disable-dropbear.service
+    mode: '0644'
+    owner: root
+    group: root
+    content: |
+      [Unit]
+      Description=Désactiver Dropbear initramfs (port 2222) après boot complet
+      Documentation=https://github.com/jura39bot/dropbear-initramfs
+      # S'exécute après que sshd soit up et actif
+      After=ssh.service network-online.target
+      Requires=ssh.service
+      # Une seule exécution au boot
+      ConditionPathExists=!/var/run/dropbear-disabled.flag
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/disable-dropbear-port.sh
+      ExecStartPost=/usr/bin/touch /var/run/dropbear-disabled.flag
+      RemainAfterExit=yes
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+# ── 3. Activer le service ───────────────────────────────────────────────────
+- name: Activer et démarrer le service disable-dropbear
+  systemd:
+    name: disable-dropbear.service
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ── 4. Vérification ────────────────────────────────────────────────────────
+- name: Vérifier le statut du service
+  command: systemctl is-active disable-dropbear.service
+  register: svc_status
+  changed_when: false
+  ignore_errors: true
+
+- name: Lire le log
+  command: tail -5 /var/log/disable-dropbear.log
+  register: dropbear_log
+  changed_when: false
+  ignore_errors: true
+
+- name: "✅ Résultat"
+  debug:
+    msg: |
+      Service disable-dropbear : {{ svc_status.stdout }}
+      Log : {{ dropbear_log.stdout }}
+      Port 2222 bloqué automatiquement dès que sshd est actif.
